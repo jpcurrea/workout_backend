@@ -1,0 +1,254 @@
+"""
+FastAPI backend for workout routine mobile app
+Converts existing workout routine logic into REST API endpoints
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import datetime
+import pandas as pd
+import numpy as np
+import sys
+import os
+
+# Add local directory to path to import mseq
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from mseq import mseq
+
+app = FastAPI(title="Workout Routine API", version="1.0.0")
+
+# Add CORS middleware to allow requests from mobile app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic models for API requests/responses
+class Workout(BaseModel):
+    name: str
+    goal: float
+    units: str
+    at_park: bool
+
+class WorkoutScheduleItem(BaseModel):
+    date: str
+    workout: str
+    score: Optional[float] = None
+    units: str
+    at_park: bool
+    goal: float
+
+class WorkoutUpdate(BaseModel):
+    workout: str
+    date: str
+    score: float
+
+class RoutineGenerationRequest(BaseModel):
+    start_date: Optional[str] = None
+    sequence_power: Optional[int] = 4
+
+# Global variables to cache data
+workouts_df = None
+schedule_df = None
+
+def load_data():
+    """Load workout data from CSV files"""
+    global workouts_df, schedule_df
+    try:
+        workouts_df = pd.read_csv("./workouts.csv")
+        if os.path.exists("./schedule.pkl"):
+            schedule_df = pd.read_pickle("./schedule.pkl")
+            schedule_df['date'] = pd.to_datetime(schedule_df['date'])
+        else:
+            schedule_df = pd.DataFrame()
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        workouts_df = pd.DataFrame()
+        schedule_df = pd.DataFrame()
+
+@app.on_event("startup")
+async def startup_event():
+    load_data()
+
+@app.get("/")
+async def root():
+    return {"message": "Workout Routine API is running"}
+
+@app.get("/workouts", response_model=List[Workout])
+async def get_workouts():
+    """Get all available workouts"""
+    if workouts_df.empty:
+        load_data()
+    
+    workouts = []
+    for _, row in workouts_df.iterrows():
+        workouts.append(Workout(
+            name=row['name'],
+            goal=row['goal'],
+            units=row['units'],
+            at_park=bool(row['at_park'])
+        ))
+    return workouts
+
+@app.get("/today", response_model=List[WorkoutScheduleItem])
+async def get_today_workouts():
+    """Get today's workout schedule"""
+    if schedule_df.empty:
+        return []
+    
+    today = datetime.datetime.today()
+    inds = abs(schedule_df.date.dt.date - today.date()) < datetime.timedelta(days=1)
+    workouts_today = schedule_df.loc[inds].copy()
+    workouts_today = workouts_today.sort_values(by=['at_park'])
+    
+    # Merge with workouts to get goals
+    workouts_with_goals = workouts_today.merge(
+        workouts_df[['name', 'goal']], 
+        left_on='workout', 
+        right_on='name', 
+        how='left'
+    )
+    
+    result = []
+    for _, row in workouts_with_goals.iterrows():
+        result.append(WorkoutScheduleItem(
+            date=row['date'].strftime('%Y-%m-%d'),
+            workout=row['workout'],
+            score=row['score'] if pd.notna(row['score']) else None,
+            units=row['units'],
+            at_park=bool(row['at_park']),
+            goal=row['goal'] if pd.notna(row['goal']) else 0
+        ))
+    
+    return result
+
+@app.get("/schedule/{date}", response_model=List[WorkoutScheduleItem])
+async def get_workouts_for_date(date: str):
+    """Get workouts for a specific date (YYYY-MM-DD format)"""
+    if schedule_df.empty:
+        return []
+    
+    try:
+        target_date = datetime.datetime.strptime(date, '%Y-%m-%d')
+        inds = abs(schedule_df.date.dt.date - target_date.date()) < datetime.timedelta(days=1)
+        workouts_for_date = schedule_df.loc[inds].copy()
+        workouts_for_date = workouts_for_date.sort_values(by=['at_park'])
+        
+        # Merge with workouts to get goals
+        workouts_with_goals = workouts_for_date.merge(
+            workouts_df[['name', 'goal']], 
+            left_on='workout', 
+            right_on='name', 
+            how='left'
+        )
+        
+        result = []
+        for _, row in workouts_with_goals.iterrows():
+            result.append(WorkoutScheduleItem(
+                date=row['date'].strftime('%Y-%m-%d'),
+                workout=row['workout'],
+                score=row['score'] if pd.notna(row['score']) else None,
+                units=row['units'],
+                at_park=bool(row['at_park']),
+                goal=row['goal'] if pd.notna(row['goal']) else 0
+            ))
+        
+        return result
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+@app.post("/update-score")
+async def update_workout_score(update: WorkoutUpdate):
+    """Update the score for a specific workout on a specific date"""
+    global schedule_df
+    
+    if schedule_df.empty:
+        raise HTTPException(status_code=404, detail="No schedule data found")
+    
+    try:
+        target_date = datetime.datetime.strptime(update.date, '%Y-%m-%d')
+        
+        # Find the specific workout entry
+        mask = (
+            (abs(schedule_df.date.dt.date - target_date.date()) < datetime.timedelta(days=1)) &
+            (schedule_df.workout == update.workout)
+        )
+        
+        if not mask.any():
+            raise HTTPException(status_code=404, detail="Workout not found for this date")
+        
+        # Update the score
+        schedule_df.loc[mask, 'score'] = update.score
+        
+        # Save back to pickle file
+        schedule_df.to_pickle("./schedule.pkl")
+        
+        return {"message": "Score updated successfully"}
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+@app.post("/generate-routine")
+async def generate_new_routine(request: RoutineGenerationRequest):
+    """Generate a new workout routine using m-sequences"""
+    global schedule_df
+    
+    if workouts_df.empty:
+        raise HTTPException(status_code=400, detail="No workouts data found")
+    
+    SEQUENCE_POWER = request.sequence_power or 4
+    NUM_FRAMES = 5 ** SEQUENCE_POWER - 1
+    
+    # Determine start date
+    if request.start_date:
+        try:
+            base = datetime.datetime.strptime(request.start_date, '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start date format. Use YYYY-MM-DD")
+    else:
+        base = datetime.datetime.today()
+    
+    # Generate date list
+    date_list = np.array([base + datetime.timedelta(days=2*x) for x in range(NUM_FRAMES)])
+    
+    # Generate schedule
+    schedule = {'date': [], 'workout': [], 'score': [], 'units': [], 'at_park': []}
+    
+    # Generate msequences for each workout
+    for num, workout in workouts_df.iterrows():
+        # Generate a random shift
+        shift = np.random.randint(0, NUM_FRAMES - 1)
+        seq = mseq(5, SEQUENCE_POWER, whichSeq=num, shift=shift)
+        
+        # Add dates whenever there is a 1 in the sequence
+        dates = date_list[seq == 1]
+        schedule['date'].extend(dates)
+        schedule['workout'].extend([workout['name']] * len(dates))
+        schedule['score'].extend([np.nan] * len(dates))
+        schedule['units'].extend([workout['units']] * len(dates))
+        schedule['at_park'].extend([workout['at_park']] * len(dates))
+    
+    # Create DataFrame and sort by date
+    schedule_df = pd.DataFrame(schedule)
+    schedule_df = schedule_df.sort_values(by=['date'])
+    
+    # Save to pickle file
+    schedule_df.to_pickle("./schedule.pkl")
+    
+    return {
+        "message": "New routine generated successfully",
+        "total_workouts": len(schedule_df),
+        "date_range": {
+            "start": schedule_df.date.min().strftime('%Y-%m-%d'),
+            "end": schedule_df.date.max().strftime('%Y-%m-%d')
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
