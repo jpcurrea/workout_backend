@@ -4,6 +4,7 @@ Converts existing workout routine logic into REST API endpoints
 """
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -56,14 +57,22 @@ class RoutineGenerationRequest(BaseModel):
 workouts_df = None
 schedule_df = None
 
+def get_data_dir():
+    """Get the data directory - use /data if it exists (Render), otherwise current directory"""
+    data_dir = "/data" if os.path.exists("/data") else "."
+    return data_dir
+
 def load_data():
     """Load workout data from CSV files"""
     global workouts_df, schedule_df
+    data_dir = get_data_dir()
     try:
-        workouts_df = pd.read_csv("./workouts.csv")
-        if os.path.exists("./schedule.pkl"):
-            schedule_df = pd.read_pickle("./schedule.pkl")
-            schedule_df['date'] = pd.to_datetime(schedule_df['date'])
+        workouts_df = pd.read_csv(f"{data_dir}/workouts.csv")
+        schedule_path = f"{data_dir}/schedule.pkl"
+        if os.path.exists(schedule_path):
+            schedule_df = pd.read_pickle(schedule_path)
+            # Normalize schedule dates to date-only (drop time component)
+            schedule_df['date'] = pd.to_datetime(schedule_df['date']).dt.date
         else:
             schedule_df = pd.DataFrame()
     except Exception as e:
@@ -95,14 +104,35 @@ async def get_workouts():
         ))
     return workouts
 
+
+@app.get("/workouts.csv")
+async def download_workouts_csv():
+    """Return the workouts.csv file for download."""
+    data_dir = get_data_dir()
+    file_path = f"{data_dir}/workouts.csv"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="workouts.csv not found")
+    return FileResponse(path=file_path, filename="workouts.csv", media_type='text/csv')
+
+
+@app.get("/schedule.pkl")
+async def download_schedule_pickle():
+    """Return the current schedule.pkl file for download."""
+    data_dir = get_data_dir()
+    file_path = f"{data_dir}/schedule.pkl"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="schedule.pkl not found")
+    return FileResponse(path=file_path, filename="schedule.pkl", media_type='application/octet-stream')
+
 @app.get("/today", response_model=List[WorkoutScheduleItem])
 async def get_today_workouts():
     """Get today's workout schedule"""
     if schedule_df.empty:
         return []
     
-    today = datetime.datetime.today()
-    inds = abs(schedule_df.date.dt.date - today.date()) < datetime.timedelta(days=1)
+    # Use date-only comparison to avoid time-of-day issues
+    today = datetime.date.today()
+    inds = schedule_df['date'] == today
     workouts_today = schedule_df.loc[inds].copy()
     workouts_today = workouts_today.sort_values(by=['at_park'])
     
@@ -134,8 +164,8 @@ async def get_workouts_for_date(date: str):
         return []
     
     try:
-        target_date = datetime.datetime.strptime(date, '%Y-%m-%d')
-        inds = abs(schedule_df.date.dt.date - target_date.date()) < datetime.timedelta(days=1)
+        target_date = datetime.datetime.strptime(date, '%Y-%m-%d').date()
+        inds = schedule_df['date'] == target_date
         workouts_for_date = schedule_df.loc[inds].copy()
         workouts_for_date = workouts_for_date.sort_values(by=['at_park'])
         
@@ -171,11 +201,11 @@ async def update_workout_score(update: WorkoutUpdate):
         raise HTTPException(status_code=404, detail="No schedule data found")
     
     try:
-        target_date = datetime.datetime.strptime(update.date, '%Y-%m-%d')
-        
-        # Find the specific workout entry
+        target_date = datetime.datetime.strptime(update.date, '%Y-%m-%d').date()
+
+        # Find the specific workout entry using date equality
         mask = (
-            (abs(schedule_df.date.dt.date - target_date.date()) < datetime.timedelta(days=1)) &
+            (schedule_df['date'] == target_date) &
             (schedule_df.workout == update.workout)
         )
         
@@ -186,7 +216,8 @@ async def update_workout_score(update: WorkoutUpdate):
         schedule_df.loc[mask, 'score'] = update.score
         
         # Save back to pickle file
-        schedule_df.to_pickle("./schedule.pkl")
+        data_dir = get_data_dir()
+        schedule_df.to_pickle(f"{data_dir}/schedule.pkl")
         
         return {"message": "Score updated successfully"}
     
@@ -238,7 +269,8 @@ async def generate_new_routine(request: RoutineGenerationRequest):
     schedule_df = schedule_df.sort_values(by=['date'])
     
     # Save to pickle file
-    schedule_df.to_pickle("./schedule.pkl")
+    data_dir = get_data_dir()
+    schedule_df.to_pickle(f"{data_dir}/schedule.pkl")
     
     return {
         "message": "New routine generated successfully",
