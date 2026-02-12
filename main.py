@@ -53,13 +53,24 @@ class RoutineGenerationRequest(BaseModel):
     start_date: Optional[str] = None
     sequence_power: Optional[int] = 4
 
+class WorkoutCreate(BaseModel):
+    name: str
+    goal: float
+    units: str
+    at_park: bool
+
+class WorkoutUpdateRequest(BaseModel):
+    goal: float
+    units: str
+    at_park: bool
+
 # Global variables to cache data
 workouts_df = None
 schedule_df = None
 
 def get_data_dir():
-    """Get the data directory - use /data if it exists (Render), otherwise current directory"""
-    data_dir = "/data" if os.path.exists("/data") else "."
+    """Get the data directory - use /data if it exists (Render), otherwise ./data for local"""
+    data_dir = "/data" if os.path.exists("/data") else "./data"
     return data_dir
 
 def load_data():
@@ -71,8 +82,8 @@ def load_data():
         schedule_path = f"{data_dir}/schedule.pkl"
         if os.path.exists(schedule_path):
             schedule_df = pd.read_pickle(schedule_path)
-            # Normalize schedule dates to date-only (drop time component)
-            schedule_df['date'] = pd.to_datetime(schedule_df['date']).dt.date
+            # Normalize schedule dates to midnight (drop time component)
+            schedule_df['date'] = pd.to_datetime(schedule_df['date']).dt.normalize()
         else:
             schedule_df = pd.DataFrame()
     except Exception as e:
@@ -126,14 +137,24 @@ async def download_schedule_pickle():
 
 @app.get("/today", response_model=List[WorkoutScheduleItem])
 async def get_today_workouts():
-    """Get today's workout schedule"""
+    """Get today's workout schedule, or the most recent previous workout if none scheduled for today"""
     if schedule_df.empty:
         return []
     
     # Use date-only comparison to avoid time-of-day issues
-    today = datetime.date.today()
+    today = pd.Timestamp(datetime.date.today()).normalize()
     inds = schedule_df['date'] == today
     workouts_today = schedule_df.loc[inds].copy()
+    
+    # If no workouts today, find the most recent previous date with workouts
+    if workouts_today.empty:
+        past_workouts = schedule_df[schedule_df['date'] < today]
+        if not past_workouts.empty:
+            # Get the most recent date
+            most_recent_date = past_workouts['date'].max()
+            inds = schedule_df['date'] == most_recent_date
+            workouts_today = schedule_df.loc[inds].copy()
+    
     workouts_today = workouts_today.sort_values(by=['at_park'])
     
     # Merge with workouts to get goals
@@ -164,7 +185,7 @@ async def get_workouts_for_date(date: str):
         return []
     
     try:
-        target_date = datetime.datetime.strptime(date, '%Y-%m-%d').date()
+        target_date = pd.Timestamp(datetime.datetime.strptime(date, '%Y-%m-%d')).normalize()
         inds = schedule_df['date'] == target_date
         workouts_for_date = schedule_df.loc[inds].copy()
         workouts_for_date = workouts_for_date.sort_values(by=['at_park'])
@@ -201,7 +222,7 @@ async def update_workout_score(update: WorkoutUpdate):
         raise HTTPException(status_code=404, detail="No schedule data found")
     
     try:
-        target_date = datetime.datetime.strptime(update.date, '%Y-%m-%d').date()
+        target_date = pd.Timestamp(datetime.datetime.strptime(update.date, '%Y-%m-%d')).normalize()
 
         # Find the specific workout entry using date equality
         mask = (
@@ -280,6 +301,78 @@ async def generate_new_routine(request: RoutineGenerationRequest):
             "end": schedule_df.date.max().strftime('%Y-%m-%d')
         }
     }
+
+@app.post("/workouts")
+async def create_workout(workout: WorkoutCreate):
+    """Add a new workout to the workouts list"""
+    global workouts_df
+    
+    if workouts_df.empty:
+        load_data()
+    
+    # Check if workout name already exists
+    if workout.name in workouts_df['name'].values:
+        raise HTTPException(status_code=400, detail="Workout with this name already exists")
+    
+    # Add new workout to dataframe
+    new_row = pd.DataFrame([{
+        'name': workout.name,
+        'goal': workout.goal,
+        'units': workout.units,
+        'at_park': workout.at_park
+    }])
+    workouts_df = pd.concat([workouts_df, new_row], ignore_index=True)
+    
+    # Save to CSV
+    data_dir = get_data_dir()
+    workouts_df.to_csv(f"{data_dir}/workouts.csv", index=False)
+    
+    return {"message": "Workout created successfully", "workout": workout.dict()}
+
+@app.put("/workouts/{workout_name}")
+async def update_workout(workout_name: str, workout: WorkoutUpdateRequest):
+    """Update an existing workout's parameters"""
+    global workouts_df
+    
+    if workouts_df.empty:
+        load_data()
+    
+    # Check if workout exists
+    if workout_name not in workouts_df['name'].values:
+        raise HTTPException(status_code=404, detail="Workout not found")
+    
+    # Update workout parameters
+    mask = workouts_df['name'] == workout_name
+    workouts_df.loc[mask, 'goal'] = workout.goal
+    workouts_df.loc[mask, 'units'] = workout.units
+    workouts_df.loc[mask, 'at_park'] = workout.at_park
+    
+    # Save to CSV
+    data_dir = get_data_dir()
+    workouts_df.to_csv(f"{data_dir}/workouts.csv", index=False)
+    
+    return {"message": "Workout updated successfully"}
+
+@app.delete("/workouts/{workout_name}")
+async def delete_workout(workout_name: str):
+    """Delete a workout from the workouts list"""
+    global workouts_df
+    
+    if workouts_df.empty:
+        load_data()
+    
+    # Check if workout exists
+    if workout_name not in workouts_df['name'].values:
+        raise HTTPException(status_code=404, detail="Workout not found")
+    
+    # Remove workout from dataframe
+    workouts_df = workouts_df[workouts_df['name'] != workout_name]
+    
+    # Save to CSV
+    data_dir = get_data_dir()
+    workouts_df.to_csv(f"{data_dir}/workouts.csv", index=False)
+    
+    return {"message": "Workout deleted successfully"}
 
 if __name__ == "__main__":
     import uvicorn
